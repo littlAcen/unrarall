@@ -663,22 +663,39 @@ while [ -n "$1" ]; do
     shift
 done
 
-# Detect the version of find available and create a wrapper function that
-# that will behave like find using posix egrep style regular expressions.
-# This is to force consistency across multiple platforms.
-
-# Check FIND binary exists
-if ! type -P "${FIND}" > /dev/null 2>&1 ; then
-  message error "Cannot find the \"find\" binary (\"${FIND}\") in your path"
-  exit 1
-fi
-
-# FIXME: Require -iregex support for now. We should try to teach the wrappers
-# how to fall back to `-regex` or something...
-if [ "$(${FIND} /dev/null -iregex 'test' > /dev/null 2>&1 ; echo $?)" -ne "0" ]; then
-  message error "Your version of find (\"${FIND}\") does not support the \"-iregex\" flag"
-  exit 1
-fi
+## Check FIND binary exists
+#if ! type -P "${FIND}" > /dev/null 2>&1 ; then
+#  message error "Cannot find the \"find\" binary (\"${FIND}\") in your path"
+#  exit 1
+#fi
+#
+## FIXME: Require -iregex support for now. We should try to teach the wrappers
+## how to fall back to `-regex` or something...
+#if [ "$(${FIND} /dev/null -iregex 'test' > /dev/null 2>&1 ; echo $?)" -ne "0" ]; then
+#  message error "Your version of find (\"${FIND}\") does not support the \"-iregex\" flag"
+#  exit 1
+#fi
+#
+#if [ "X$(${FIND} --version >/dev/null 2>&1 ; echo $?)" == "X0" ]; then
+#  # GNU find supports `--version`
+#  [ $VERBOSE -eq 1 ] && message info "Detected GNU find"
+#  function find_wrapper() {
+#    if [ $# -lt 2 ]; then
+#      message error "Invalid args to find_wrapper"
+#      exit 1
+#    fi
+#    args=("$@")
+#    unset args[0]
+#    ${FIND} "$1" -regextype posix-egrep "${args[@]}"
+#  }
+#else
+#  # Assume *BSD/macOS find
+#  [ $VERBOSE -eq 1 ] && message info "Detected BSD find"
+#  function find_wrapper() {
+#    ${FIND} -E "$@" -maxdepth 1 "${@:2}"
+#  }
+#fi
+#[ $VERBOSE -eq 1 ] && message info "Using find: ${FIND}"
 
 if [ "X$(${FIND} --version >/dev/null 2>&1 ; echo $?)" == "X0" ]; then
   # GNU find supports `--version`
@@ -690,17 +707,15 @@ if [ "X$(${FIND} --version >/dev/null 2>&1 ; echo $?)" == "X0" ]; then
     fi
     args=("$@")
     unset args[0]
-    ${FIND} "$1" -regextype posix-egrep "${args[@]}"
+    ${FIND} "$1" -maxdepth 1 -regextype posix-egrep "${args[@]}"
   }
 else
   # Assume *BSD/macOS find
   [ $VERBOSE -eq 1 ] && message info "Detected BSD find"
   function find_wrapper() {
-    ${FIND} -E "$@"
+    ${FIND} -E "$1" -maxdepth 1 "${@:2}"
   }
 fi
-[ $VERBOSE -eq 1 ] && message info "Using find: ${FIND}"
-
 
 detect_clean_up_hooks
 
