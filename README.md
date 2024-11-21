@@ -1,3 +1,12 @@
+```
+das zweite  bash script 'unpack' am besten nach /usr/local/bin/ packen und dann kann es in einem Verzeichnis aufrufen, in dem man sich gerade befindet und dort Archive liegen (*.zip;*.rar;*.001;*.7z)
+im scrkpt hardgecoded findet ihr einen verweis zu einem passwortfile, welches das script durchgeht um das passwort für das zu entpackende Archiv zu entschlüsseln.
+
++´Klappt richtig gut ;)+
+
+Bei Fragen gerne melden! :D
+```
+
 GREAT tool, if you have like 100 (or more? ;-) files to extract and some of them are with a password.
 
 for me the original script was too slow inbetween (on  a Mac) the extraction so that i modified it to just 
@@ -77,12 +86,3 @@ Name and idea comes from "jeremy" see -
 http://askubuntu.com/questions/7059/script-app-to-unrar-files-and-only-delete-the-archives-which-were-sucessfully
 
 [![Analytics](https://ga-beacon.appspot.com/UA-11959363-2/arfoll/unrarall)](https://github.com/igrigorik/ga-beacon)
-
-```
-das zweite  bash script 'unpack' am besten nach /usr/local/bin/ packen und dann kann es in einem Verzeichnis aufrufen, in dem man sich gerade befindet und dort Archive liegen (*.zip;*.rar;*.001;*.7z)
-im scrkpt hardgecoded findet ihr einen verweis zu einem passwortfile, welches das script durchgeht um das passwort für das zu entpackende Archiv zu entschlüsseln.
-
-+´Klappt richtig gut ;)+
-
-Bei Fragen gerne melden! :D
-```
