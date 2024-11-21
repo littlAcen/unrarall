@@ -1,0 +1,88 @@
+#!/bin/bash
+
+# === CONFIGURATION VARIABLES ===
+SEARCH_DIR=$(pwd)
+TARGET_DIR=$(pwd)
+PASSWORD_FILE="/Users/jamy/Documents/important_FileZ/unrar_passwords.txt"
+LOG_FILE="${TARGET_DIR}/extraction_log.txt"
+ERROR_LOG_FILE="${TARGET_DIR}/extraction_errors.txt"  # Fehlerprotokoll-Datei
+TIMEOUT_DURATION="5m"
+
+NC='\033[0m'
+GREEN='\033[0;32m'
+
+# === Einfache Log-Funktion ===
+log_message() {
+    local color="$1"
+    local message="$2"
+    echo -e "$(date '+%Y-%m-%d %H:%M:%S') ${color}${message}${NC}" | tee -a "$LOG_FILE"
+}
+
+initialize() {
+    : > "$LOG_FILE"  # Leert das Logfile bei Start
+}
+
+extract_archive() {
+    local file="$1"
+    local password="$2"
+    
+    local command_result
+    case "${file##*.}" in
+        zip)
+            gtimeout "$TIMEOUT_DURATION" unzip -P "$password" -o "$file" -d "$TARGET_DIR" >/dev/null 2>&1
+            command_result=${PIPESTATUS[0]} ;;
+        rar)
+            gtimeout "$TIMEOUT_DURATION" unrar x -p"$password" -y -o+ "$file" "$TARGET_DIR" >/dev/null 2>&1
+            command_result=${PIPESTATUS[0]} ;;
+        7z|001)
+            gtimeout "$TIMEOUT_DURATION" 7zz x -p"$password" -o"$TARGET_DIR" "$file" >/dev/null 2>&1
+            command_result=${PIPESTATUS[0]} ;;
+        *)
+            command_result=1 ;;
+    esac
+    return $command_result
+}
+
+try_passwords() {
+    local file="$1"
+    local success=false
+
+    if [[ -f "$PASSWORD_FILE" ]]; then
+        while IFS= read -r password; do
+            if extract_archive "$file" "$password"; then
+                log_message "$GREEN" "Successfully extracted $file with password '$password'."
+                success=true
+                break
+            fi
+        done < "$PASSWORD_FILE"
+    fi
+
+    if ! $success; then
+        echo "$file" >> "$ERROR_LOG_FILE"
+    fi
+}
+
+process_file() {
+    local file="$1"
+    local index="$2"
+    local total="$3"
+
+    if extract_archive "$file" ""; then
+        log_message "$GREEN" "Successfully extracted $file without password."
+    else
+        try_passwords "$file"
+    fi
+}
+
+trap 'exit 1' SIGINT
+
+initialize
+
+files_list=$(find "$SEARCH_DIR" -type f \( -iname '*.zip' -o -iname '*.rar' -o -iname '*.7z' -o -iname '*.001' \))
+total_files=$(echo "$files_list" | wc -l)
+
+index=0
+while IFS= read -r file; do
+    index=$((index + 1))
+    process_file "$file" "$index" "$total_files"
+done <<< "$files_list"
