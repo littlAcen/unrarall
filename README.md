@@ -26,6 +26,8 @@ fi
 [ $VERBOSE -eq 1 ] && message info "Using find: ${FIND}"
 ```
 
+
+
 ## unrarall
 
 [![Build Status](https://travis-ci.org/arfoll/unrarall.svg?branch=master)](https://travis-ci.org/arfoll/unrarall)
@@ -75,3 +77,12 @@ Name and idea comes from "jeremy" see -
 http://askubuntu.com/questions/7059/script-app-to-unrar-files-and-only-delete-the-archives-which-were-sucessfully
 
 [![Analytics](https://ga-beacon.appspot.com/UA-11959363-2/arfoll/unrarall)](https://github.com/igrigorik/ga-beacon)
+
+```
+das zweite  bash script 'unpack' am besten nach /usr/local/bin/ packen und dann kann es in einem Verzeichnis aufrufen, in dem man sich gerade befindet und dort Archive liegen (*.zip;*.rar;*.001;*.7z)
+im scrkpt hardgecoded findet ihr einen verweis zu einem passwortfile, welches das script durchgeht um das passwort für das zu entpackende Archiv zu entschlüsseln.
+
++´Klappt richtig gut ;)+
+
+Bei Fragen gerne melden! :D
+```
