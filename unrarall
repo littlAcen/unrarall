@@ -682,25 +682,24 @@ fi
 
 if [ "X$(${FIND} --version >/dev/null 2>&1 ; echo $?)" == "X0" ]; then
   # GNU find supports `--version`
-  [ $VERBOSE -eq 1 ] && message info "Detected GNU find"
+  [ $VERBOSE -eq 1 ] && message info "Detected GNU find"  
   function find_wrapper() {
     if [ $# -lt 2 ]; then
       message error "Invalid args to find_wrapper"
       exit 1
-    fi
+    fi   
     args=("$@")
     unset args[0]
-    ${FIND} "$1" -regextype posix-egrep "${args[@]}"
+    ${FIND} "$1" -depth -maxdepth 2 -regextype posix-egrep "${args[@]}"
   }
-else
+else  
   # Assume *BSD/macOS find
   [ $VERBOSE -eq 1 ] && message info "Detected BSD find"
   function find_wrapper() {
-    ${FIND} -E "$@"
+    ${FIND} -E "$1" -depth -maxdepth 2 "$@"
   }
 fi
 [ $VERBOSE -eq 1 ] && message info "Using find: ${FIND}"
-
 
 detect_clean_up_hooks
 
