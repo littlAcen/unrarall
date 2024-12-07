@@ -13,23 +13,27 @@ for me the original script was too slow inbetween (on  a Mac) the extraction so 
 search for the next level with the find switch: -maxdepth 2, like this:
 
 ```
-if [ "X$(${FIND} --version >/dev/null 2>&1 ; echo $?)" == "X0" ]; then
+if [ "X$(${FIND} --version >/dev/null 2>&1 ; echo $?)" == "X0" ]; then 
   # GNU find supports `--version`
-  [ $VERBOSE -eq 1 ] && message info "Detected GNU find"  
+  [ $VERBOSE -eq 1 ] && message info "Detected GNU find"
   function find_wrapper() {
-    if [ $# -lt 2 ]; then
+    if [ $# -lt 2 ]; then 
       message error "Invalid args to find_wrapper"
       exit 1
     fi   
     args=("$@")
     unset args[0]
+    [ $VERBOSE -eq 1 ] && echo "Running GNU find command: ${FIND} \"$1\" -depth -maxdepth 2 -regextype posix-egrep \"${args[@]}\""
     ${FIND} "$1" -depth -maxdepth 2 -regextype posix-egrep "${args[@]}"
   }
-else  
-  # Assume *BSD/macOS find
+else
+  # Assume BSD/macOS find
   [ $VERBOSE -eq 1 ] && message info "Detected BSD find"
   function find_wrapper() {
-    ${FIND} -E "$1" -depth -maxdepth 2 "$@"
+    args=("$@")
+    unset args[0]
+    [ $VERBOSE -eq 1 ] && echo "Running BSD find command: ${FIND} -E \"$1\" -depth -maxdepth 2 \"${args[@]}\""
+    ${FIND} -E "$1" -depth -maxdepth 2 "${args[@]}"
   }
 fi
 [ $VERBOSE -eq 1 ] && message info "Using find: ${FIND}"
