@@ -680,26 +680,32 @@ if [ "$(${FIND} /dev/null -iregex 'test' > /dev/null 2>&1 ; echo $?)" -ne "0" ];
   exit 1
 fi
 
-if [ "X$(${FIND} --version >/dev/null 2>&1 ; echo $?)" == "X0" ]; then
-  # GNU find supports `--version`
-  [ $VERBOSE -eq 1 ] && message info "Detected GNU find"
-  function find_wrapper() {
-    if [ $# -lt 2 ]; then
-      message error "Invalid args to find_wrapper"
-      exit 1
-    fi
-    args=("$@")
-    unset args[0]
-    ${FIND} "$1" -regextype posix-egrep "${args[@]}"
-  }
-else
-  # Assume *BSD/macOS find
-  [ $VERBOSE -eq 1 ] && message info "Detected BSD find"
-  function find_wrapper() {
-    ${FIND} -E "$@"
-  }
-fi
-[ $VERBOSE -eq 1 ] && message info "Using find: ${FIND}"
+   if [ "X$(${FIND} --version >/dev/null 2>&1 ; echo $?)" == "X0" ]; then
+     # GNU find supports `--version`
+     [ $VERBOSE -eq 1 ] && message info "Detected GNU find"
+     function find_wrapper() {
+       if [ $# -lt 2 ]; then
+         message error "Invalid args to find_wrapper"
+         exit 1
+       fi
+       args=("$@")
+       unset args[0]
+       # Remove or adjust the following debug statement if needed for clearer separation
+       #[ $VERBOSE -eq 1 ] && message info "Running GNU find command: ${FIND} \"$1\" -depth -maxdepth 2 -regextype posix-egrep \"${args[@]}\""
+       ${FIND} "$1" -depth -maxdepth 2 -regextype posix-egrep "${args[@]}"
+     }
+   else
+     # Assume BSD/macOS find
+     [ $VERBOSE -eq 1 ] && message info "Detected BSD find"
+     function find_wrapper() {
+       args=("$@")
+       unset args[0]
+       # Remove or adjust the following debug statement if needed for clearer separation
+       #[ $VERBOSE -eq 1 ] && message info "Running BSD find command: ${FIND} -E \"$1\" -depth -maxdepth 2 \"${args[@]}\""
+       ${FIND} -E "$1" -depth -maxdepth 2 "${args[@]}"
+     }
+   fi
+   [ $VERBOSE -eq 1 ] && message info "Using find: ${FIND}"
 
 
 detect_clean_up_hooks
