@@ -42,9 +42,6 @@ if (-not $PSBoundParameters.ContainsKey('DisableCksfv')) {
 if (-not $PSBoundParameters.ContainsKey('AllowFailures')) {
     $AllowFailures = $true
 }
-if (-not $PSBoundParameters.ContainsKey('Force')) {
-    $Force = $true
-}
 
 # Clean up hooks
 $script:UNRARALL_DETECTED_CLEAN_UP_HOOKS = @()
