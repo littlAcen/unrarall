@@ -727,7 +727,13 @@ function Process-Directory {
             if ($Output) {
                 $targetDir = $Output
             } else {
-                $targetDir = $file.DirectoryName
+                # Extract to subdirectory named after the RAR file
+                $targetDir = Join-Path $file.DirectoryName $sfilename
+                if (-not (Test-Path $targetDir)) {
+                    if (-not $Dry) {
+                        New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
+                    }
+                }
             }
 
             foreach ($extractedFile in $extractedFiles) {
