@@ -55,6 +55,11 @@ $script:FAIL_COUNT = 0
 # Password file - use configured default
 $script:UNRARALL_PASSWORD_FILE = $PasswordFile
 
+# Password caching - remember working passwords
+$script:PASSWORD_CACHE = @{}
+$script:PASSWORD_TEST_COUNT = 0
+$script:MAX_PASSWORD_TESTS = 3  # Only test passwords on first 3 files
+
 function Show-Usage {
     Write-Host @"
 Usage: $UNRARALL_EXECUTABLE_NAME [-Directory <DIRECTORY>] [--Clean <hook[,hook]>] [--Force]
@@ -694,9 +699,19 @@ function Process-Directory {
             }
         }
 
-        $tempDir = Join-Path $env:TEMP ([System.Guid]::NewGuid().ToString())
-        if (-not $Dry) {
-            New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
+        # Determine target directory BEFORE extraction
+        if ($Output) {
+            $targetDir = $Output
+        } else {
+            # Extract to subdirectory named after the RAR file
+            $targetDir = Join-Path $file.DirectoryName $sfilename
+        }
+
+        # Create target directory if it doesn't exist
+        if (-not (Test-Path $targetDir)) {
+            if (-not $Dry) {
+                New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
+            }
         }
 
         try {
@@ -714,31 +729,59 @@ function Process-Directory {
             $encrypted = Is-RarEncrypted $script:UNRARALL_BIN $file.FullName
 
             if ($encrypted) {
-                if (Test-Path $script:UNRARALL_PASSWORD_FILE) {
-                    $passwords = Get-Content $script:UNRARALL_PASSWORD_FILE
-                    $extracted = $false
-
-                    foreach ($password in $passwords) {
-                        try {
-                            $result = Extract-WithProgress $script:UNRARALL_BIN $file.FullName $tempDir $password
-                            if ($result.Success) {
-                                if ($ShowProgress) {
-                                    Write-Message "info" "Extracted with password"
-                                }
-                                $extracted = $true
-                                break
-                            }
-                        } catch {}
+                # Check if we have a cached password for this directory
+                $archiveDir = $file.DirectoryName
+                $cachedPassword = $script:PASSWORD_CACHE[$archiveDir]
+                
+                if ($cachedPassword) {
+                    # Use cached password
+                    if ($ShowProgress) {
+                        Write-Message "info" ("Using cached password (file $currentFile/$totalFiles)")
                     }
+                    $result = Extract-WithProgress $script:UNRARALL_BIN $file.FullName $targetDir $cachedPassword
+                    if (-not $result.Success) {
+                        throw "Cached password failed - archive might have different password"
+                    }
+                    $extracted = $true
+                } elseif ($script:PASSWORD_TEST_COUNT -lt $script:MAX_PASSWORD_TESTS) {
+                    # Test passwords on first 3 files only
+                    $script:PASSWORD_TEST_COUNT++
+                    
+                    if (Test-Path $script:UNRARALL_PASSWORD_FILE) {
+                        $passwords = Get-Content $script:UNRARALL_PASSWORD_FILE | Where-Object { $_.Trim() -ne "" -and -not $_.StartsWith("#") }
+                        $extracted = $false
 
-                    if (-not $extracted) {
-                        throw "Could not extract with any password"
+                        if ($ShowProgress) {
+                            Write-Message "warn" ("Password protected - testing $($passwords.Count) passwords (file $script:PASSWORD_TEST_COUNT/$script:MAX_PASSWORD_TESTS)...")
+                        }
+
+                        foreach ($password in $passwords) {
+                            try {
+                                $result = Extract-WithProgress $script:UNRARALL_BIN $file.FullName $targetDir $password
+                                if ($result.Success) {
+                                    # Cache the working password
+                                    $script:PASSWORD_CACHE[$archiveDir] = $password
+                                    if ($ShowProgress) {
+                                        Write-Message "ok" ("✓ Found working password: $password (cached for remaining files)")
+                                    }
+                                    $extracted = $true
+                                    break
+                                }
+                            } catch {}
+                        }
+
+                        if (-not $extracted) {
+                            throw "Could not extract with any password"
+                        }
+                    } else {
+                        throw "Archive is encrypted but password file not found: $script:UNRARALL_PASSWORD_FILE"
                     }
                 } else {
-                    throw "Archive is encrypted but no password file provided"
+                    # Already tested 3 files but no password found - this shouldn't happen if cache works
+                    throw "Password testing limit reached (tested $script:MAX_PASSWORD_TESTS files) - no working password found"
                 }
             } else {
-                $result = Extract-WithProgress $script:UNRARALL_BIN $file.FullName $tempDir
+                $result = Extract-WithProgress $script:UNRARALL_BIN $file.FullName $targetDir
                 if (-not $result.Success) {
                     switch ($result.ExitCode) {
                         2    { throw "Fatal error in archive" }
@@ -759,44 +802,15 @@ function Process-Directory {
             Write-Message "ok" "OK"
             $script:COUNT++
 
+            # Handle nested archives if depth allows
             if ($CurrentDepth -gt 0) {
-                $nestedRars = Get-ChildItem -Path $tempDir -Recurse -Include @("*.rar", "*.001") -File -ErrorAction SilentlyContinue
+                $nestedRars = Get-ChildItem -Path $targetDir -Recurse -Include @("*.rar", "*.001") -File -ErrorAction SilentlyContinue
                 if ($nestedRars.Count -gt 0) {
                     if ($ShowProgress) {
                         Write-Message "info" ("Detected rar archives inside of " + $file.FullName + ", recursively extracting")
                     }
-                    Process-Directory $tempDir ($CurrentDepth - 1)
+                    Process-Directory $targetDir ($CurrentDepth - 1)
                 }
-            }
-
-            $extractedFiles = if (Test-Path $tempDir) {
-                Get-ChildItem -Path $tempDir -Recurse -File -ErrorAction SilentlyContinue
-            } else { @() }
-
-            if ($Output) {
-                $targetDir = $Output
-            } else {
-                # Extract to subdirectory named after the RAR file
-                $targetDir = Join-Path $file.DirectoryName $sfilename
-                if (-not (Test-Path $targetDir)) {
-                    if (-not $Dry) {
-                        New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
-                    }
-                }
-            }
-
-            foreach ($extractedFile in $extractedFiles) {
-                $relativePath = $extractedFile.FullName.Substring($tempDir.Length + 1)
-                $targetPath   = Join-Path $targetDir $relativePath
-
-                $targetDirPath = Split-Path $targetPath -Parent
-                if (-not (Test-Path $targetDirPath)) {
-                    if (-not $Dry) {
-                        New-Item -ItemType Directory -Path $targetDirPath -Force | Out-Null
-                    }
-                }
-
-                Safe-Move $extractedFile.FullName $targetPath
             }
 
             if ($script:UNRARALL_CLEAN_UP_HOOKS_TO_RUN[0] -ne "none") {
@@ -833,10 +847,6 @@ function Process-Directory {
             Write-Message "error" ("Failed: " + $_.Exception.Message)
             $script:FAIL_COUNT++
             $script:COUNT--
-        } finally {
-            if (-not $Dry -and (Test-Path $tempDir)) {
-                Remove-Item $tempDir -Recurse -Force -ErrorAction SilentlyContinue
-            }
         }
 
         if ($ShowProgress -and $totalFiles -gt 0) {
