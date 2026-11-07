@@ -1,888 +1,781 @@
-# unrarall.ps1 - Mit Fortschrittsanzeige
+#Requires -Version 5.1
+# unrarall.ps1 - Extract RAR / multi-volume archives with progress, password list and cleanup hooks.
+# Version 0.6.0-acen-configured (ASCII only on purpose: safe for Windows PowerShell 5.1 without BOM)
+
 param(
     [Parameter(Position=0)]
     [string]$Directory = ".",
 
-    [string[]]$Clean,
+    [ValidateSet('all','none','nfo','rar','osx_junk','windows_junk','covers_folders','proof_folders','sample_folders','sample_videos','empty_folders')]
+    [string[]]$Clean = @('all'),
+
     [switch]$Force,
     [switch]$ShowProgress,
     [switch]$Quiet,
-    [switch]$DisableCksfv,
+    [switch]$DisableCksfv,      # deprecated, ignored (SFV check was never implemented); kept for compatibility
     [string]$Output,
+    [ValidateRange(0,20)]
     [int]$Depth = 4,
+    [Alias('SearchDepth','MaxScanDepth')]
+    [ValidateRange(-1,100)]
+    [int]$ScanDepth = -1,       # folder levels below the start folder to search for archives (-1 = unlimited, 0 = start folder only)
     [switch]$SkipIfExists,
-    [string]$PasswordFile,
+    [string]$PasswordFile = "C:\Users\JAMy\Documents\important_FileZ\unrar_passwords.txt",
     [switch]$SevenZip,
+    [string]$SevenZipPath = "C:\Program Files\7-Zip\7z.exe",
+    [ValidateSet('7z','unrar','rar')]
     [string]$Backend,
     [switch]$Dry,
     [switch]$AllowFailures,
-    [switch]$FullPath,
+    [switch]$FullPath,          # legacy: keeping folder structure is the default now
+    [switch]$Flat,              # extract all files without folder structure
     [switch]$Help,
     [switch]$Version
 )
 
-# Set some defaults
-$UNRARALL_VERSION = "0.5.0"
-$UNRARALL_EXECUTABLE_NAME = $MyInvocation.MyCommand.Name
-$UNRARALL_PID = $PID
-$CKSFV = 0
-$UNRAR_METHOD = if ($FullPath) { "x" } else { "e" }
-$MV_BACKUP = $true
+$UNRARALL_VERSION = "0.6.0-acen-configured"
 
-# Apply default values if parameters weren't explicitly provided
-if (-not $PSBoundParameters.ContainsKey('Clean')) {
-    $Clean = @("all")
-}
-if (-not $PSBoundParameters.ContainsKey('ShowProgress')) {
-    $ShowProgress = $true
-}
-if (-not $PSBoundParameters.ContainsKey('DisableCksfv')) {
-    $DisableCksfv = $true
-}
-if (-not $PSBoundParameters.ContainsKey('AllowFailures')) {
-    $AllowFailures = $true
-}
+# ---- defaults for parameters that cannot default to $true in the param block ----
+if (-not $PSBoundParameters.ContainsKey('ShowProgress')) { $ShowProgress = [switch](-not $Quiet) }
+if ($Quiet) { $ShowProgress = [switch]$false }
+if (-not $PSBoundParameters.ContainsKey('AllowFailures')) { $AllowFailures = [switch]$true }
 
-# Clean up hooks
-$script:UNRARALL_DETECTED_CLEAN_UP_HOOKS = @()
-$script:UNRARALL_CLEAN_UP_HOOKS_TO_RUN = @("all")
-$UNRAR_BINARIES = @("unrar.exe", "rar.exe", "7z.exe", "7z")
-$script:UNRARALL_BIN = ""
-$script:COUNT = 0
-$script:FAIL_COUNT = 0
-
-# Password file default
-if (-not $PasswordFile) {
-    $script:UNRARALL_PASSWORD_FILE = Join-Path $HOME ".unrar_passwords"
-} else {
-    $script:UNRARALL_PASSWORD_FILE = $PasswordFile
-}
+# ---- script state ----
+$script:Tool           = $null
+$script:Count          = 0
+$script:FailCount      = 0
+$script:Found          = 0
+$script:Skipped        = 0
+$script:FilePasswords  = $null
+$script:KnownPasswords = New-Object 'System.Collections.Generic.List[string]'
+$script:Processed      = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+$script:ProbePassword  = 'x-unrarall-probe-x'   # dummy so 7z never waits for a password prompt
+$script:AllHooks       = @('nfo','rar','osx_junk','windows_junk','covers_folders','proof_folders','sample_folders','sample_videos','empty_folders')
+$script:Hooks          = @()
 
 function Show-Usage {
-    Write-Host @"
-Usage: $UNRARALL_EXECUTABLE_NAME [-Directory <DIRECTORY>] [--Clean <hook[,hook]>] [--Force]
-       [--ShowProgress | --Quiet] [--SevenZip] [--Dry] [--DisableCksfv] [--PasswordFile <file>]
-       [--Output <DIRECTORY>] [--Depth <amt>] [--SkipIfExists]
-       $UNRARALL_EXECUTABLE_NAME --Help
-       $UNRARALL_EXECUTABLE_NAME --Version
+    $name = Split-Path -Leaf $PSCommandPath
+    Write-Host @'
+USAGE
+  .\SCRIPT [-Directory] <dir> [-Clean <hook[,hook]>] [-Output <dir>] [-Depth <n>]
+           [-ScanDepth <n>] [-Force] [-SkipIfExists] [-Flat] [-Dry] [-Quiet | -ShowProgress]
+           [-Backend 7z|unrar|rar] [-SevenZip] [-SevenZipPath <path>]
+           [-PasswordFile <file>] [-AllowFailures]
+  .\SCRIPT -Help | -Version
 
 DESCRIPTION
-$UNRARALL_EXECUTABLE_NAME is a utility to unrar and clean up various files
-(.e.g. rar files). Sub-directories are automatically recursed and if a rar file
-exists in a sub-directory then the rar file is extracted into that subdirectory.
+  Finds RAR archives (.rar, .partNN.rar, .001) recursively and extracts each one
+  into a sub-folder named after the archive (or into -Output). Nested archives
+  are extracted up to -Depth levels. Encrypted archives are opened with passwords
+  from the password file; passwords that worked are tried first for later archives.
+
+PRECONFIGURED DEFAULTS (Acen's setup)
+  7-Zip path    C:\Program Files\7-Zip\7z.exe
+  Password file C:\Users\acen\Documents\important_FileZ\unrar_passwords.txt
+  Backend       7-Zip first, then unrar / rar (WinRAR)
+  Clean         all
+  Progress      on (use -Quiet to turn off)
 
 OPTIONS
+  -Directory <dir>     Directory to process (default: current directory)
+  -Clean <hooks>       Hooks to run after a successful extraction (default: all)
+  -Output <dir>        Extract into this directory instead of <archive folder>\<name>
+  -Depth <n>           Maximum depth for nested archives, i.e. archives inside
+                       extracted archives (default 4)
+  -ScanDepth <n>       How many folder levels below <dir> are searched for archives
+                       (default -1 = unlimited, 0 = only <dir> itself, 1 = <dir> and
+                       its direct sub-folders). Aliases: -SearchDepth, -MaxScanDepth
+  -Force               With -SkipIfExists: extract even if files already exist
+  -SkipIfExists        Skip archives whose files already exist in the target
+  -Flat                Extract without folder structure (name collisions get renamed)
+  -Dry                 Dry run: show what would be extracted, change nothing
+  -Quiet               No output (errors only via exit code)
+  -ShowProgress        Show progress bars (default on)
+  -Backend <b>         Force backend: 7z, unrar or rar
+  -SevenZip            Force 7-Zip
+  -AllowFailures       Exit 0 if at least one archive succeeded (default on;
+                       use -AllowFailures:$false to exit 1 on any failure)
+  -DisableCksfv        Deprecated, ignored
+  -FullPath            Legacy, ignored (structure is kept by default)
 
--Directory <DIRECTORY>    Directory to process (default: current directory)
--Clean <hook[,hook]>      Clean up hooks to execute
--Force                    Force unrar even if sfv check failed
--ShowProgress             Show extraction progress (including % progress bar)
--Quiet                    Be completely quiet
--SevenZip                 Force using 7zip
--Dry                      Dry run, no action performed
--DisableCksfv             Disable CRC checking
--PasswordFile <file>      Path to password file
--Output <DIRECTORY>       Directory to extract files
--Depth <amt>              Maximum depth for nested extraction (default: 4)
--SkipIfExists             Skip extraction if files already exist
--Backend <backend>        Force backend (unrar, rar, or 7z)
--AllowFailures            Ignore errors if any successful extractions
--FullPath                 Extract with full path
--Help                     Show this help
--Version                  Show version
+CLEAN-UP HOOKS (content hooks only touch the extracted folder)
+  nfo             Remove <name>.nfo next to the archive
+  rar             Remove the archive volumes and <name>.sfv
+  osx_junk        Remove .DS_Store and __MACOSX
+  windows_junk    Remove Thumbs.db
+  covers_folders  Remove Covers folders
+  proof_folders   Remove Proof folders
+  sample_folders  Remove Sample folders
+  sample_videos   Remove small sample video files
+  empty_folders   Remove empty folders
+  all / none      All hooks / no hooks
 
-CLEAN UP HOOKS:
-- nfo: Removes .nfo files with the same name as the .rar file
-- rar: Removes rar files and sfv files
-- osx_junk: Removes junk OSX files (.DS_Store)
-- windows_junk: Removes junk Windows files (Thumbs.db)
-- covers_folders: Removes Covers folders
-- proof_folders: Removes Proof folders
-- sample_folders: Removes Sample folders
-- sample_videos: Removes sample video files matching the release
-- empty_folders: Removes empty folders
-- all: Execute all the above hooks
-- none: Do not execute any clean up hooks
-
-VERSION: $UNRARALL_VERSION
-"@
+EXAMPLES
+  .\SCRIPT                               Extract everything below the current folder
+  .\SCRIPT C:\Downloads -Clean rar,nfo   Only remove archives and nfo files
+  .\SCRIPT C:\Downloads -Dry             Test run, nothing is changed
+  .\SCRIPT C:\Downloads -ScanDepth 1     Only look in C:\Downloads and its direct sub-folders
+'@.Replace('SCRIPT', $name)
+    Write-Host ("`nVERSION: " + $UNRARALL_VERSION)
 }
 
 function Write-Message {
-    param(
-        [string]$Type,
-        [string]$Message
-    )
-
+    param([string]$Type, [string]$Message)
     if ($Quiet) { return }
-
     switch ($Type) {
-        "error" { Write-Host $Message -ForegroundColor Red }
-        "ok"    { Write-Host $Message -ForegroundColor Green }
-        "info"  { Write-Host $Message }
-        "nnl"   { Write-Host $Message -NoNewline }
+        'error' { Write-Host $Message -ForegroundColor Red }
+        'warn'  { Write-Host $Message -ForegroundColor Yellow }
+        'ok'    { Write-Host $Message -ForegroundColor Green }
+        'nnl'   { Write-Host $Message -NoNewline }
         default { Write-Host $Message }
     }
 }
 
-function Show-ExtractionProgress {
+# ------------------------------------------------------------------ native process helpers
+
+function ConvertTo-NativeArgument {
+    # Quotes one argument according to the Windows command-line rules (CommandLineToArgvW).
+    param([string]$Arg)
+    if ($Arg.Length -gt 0 -and $Arg -notmatch '[\s"]') { return $Arg }
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append('"')
+    $bs = 0
+    foreach ($ch in $Arg.ToCharArray()) {
+        if ($ch -eq [char]'\') {
+            $bs++
+        } elseif ($ch -eq [char]'"') {
+            [void]$sb.Append([char]'\', ($bs * 2 + 1))
+            [void]$sb.Append('"')
+            $bs = 0
+        } else {
+            if ($bs -gt 0) { [void]$sb.Append([char]'\', $bs); $bs = 0 }
+            [void]$sb.Append($ch)
+        }
+    }
+    if ($bs -gt 0) { [void]$sb.Append([char]'\', ($bs * 2)) }
+    [void]$sb.Append('"')
+    return $sb.ToString()
+}
+
+function Get-ProgressPercent {
+    param([string]$Line)
+    $m = [regex]::Match($Line, '^\s*(\d{1,3})%')
+    if (-not $m.Success) { $m = [regex]::Match($Line, '\s(\d{1,3})%\s*$') }
+    if ($m.Success) {
+        $v = [int]$m.Groups[1].Value
+        if ($v -le 100) { return $v }
+    }
+    return -1
+}
+
+function Invoke-Native {
+    # Runs a program, returns @{ ExitCode; Lines }. Shows a progress bar when -Activity is given.
+    # stdin is closed immediately so a password prompt can never hang the script.
     param(
-        [string]$OutputLine
+        [string]$FilePath,
+        [string[]]$ArgumentList,
+        [string]$Activity,
+        [switch]$CaptureAll,
+        [switch]$Utf8
     )
 
-    if (-not $ShowProgress) { return }
-
-    if ($OutputLine -match "(\d{1,3})%") {
-        $percent = $matches[1]
-        Write-Host ("`rExtracting... {0}% complete" -f $percent) -NoNewline
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName  = $FilePath
+    $psi.Arguments = (($ArgumentList | ForEach-Object { ConvertTo-NativeArgument $_ }) -join ' ')
+    $psi.UseShellExecute        = $false
+    $psi.CreateNoWindow         = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError  = $true
+    $psi.RedirectStandardInput  = $true
+    if ($Utf8) {
+        $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+        $psi.StandardErrorEncoding  = [System.Text.Encoding]::UTF8
     }
-    elseif ($OutputLine -match "^\s*Extracting\s+") {
-        Write-Host ("`r{0}" -f $OutputLine) -NoNewline
-    }
-    elseif ($OutputLine -match "OK") {
-        Write-Host "`rExtracting... 100% complete" -NoNewline
-    }
-}
 
-function Get-UnrarFlags {
-    param([string]$Binary)
-
-    $binaryName = [System.IO.Path]::GetFileNameWithoutExtension($Binary)
-
-    switch ($binaryName) {
-        { $_ -in @("unrar", "rar") } {
-            if ($ShowProgress) {
-                return "-o+"
-            } else {
-                return "-o+ -idq"
-            }
-        }
-        "7z" {
-            if ($ShowProgress) {
-                return ""
-            } else {
-                return "-bd"
-            }
-        }
-        default {
-            Write-Message "error" ("Unsupported program: " + $Binary)
-            exit 1
-        }
-    }
-}
-
-function Is-AlreadyExtracted {
-    param(
-        [string]$Binary,
-        [string]$ArchivePath
-    )
-
-    if ($Binary -eq "echo") { return $false }
-
+    $lines = New-Object 'System.Collections.Generic.List[string]'
+    $proc  = [System.Diagnostics.Process]::Start($psi)
+    $exit  = -1
     try {
-        $binaryName = [System.IO.Path]::GetFileNameWithoutExtension($Binary)
+        $proc.StandardInput.Close()
+        $errTask = $proc.StandardError.ReadToEndAsync()
+        $reader  = $proc.StandardOutput
 
-        if ($binaryName -in @("unrar", "rar")) {
-            $files = & $Binary lb $ArchivePath
-        } elseif ($binaryName -eq "7z") {
-            $output = & $Binary L -ba -slt $ArchivePath
-            $files = $output | Where-Object { $_ -match "^Path =" } |
-                     ForEach-Object { $_ -replace "^Path =\s*", "" }
-        }
-
-        foreach ($file in $files) {
-            if (-not (Test-Path $file)) {
-                return $false
+        if ($Activity) {
+            # character-wise reading, because progress is rewritten with carriage returns
+            $sb = New-Object System.Text.StringBuilder
+            $lastPct = -1
+            while ($true) {
+                $c = $reader.Read()
+                if ($c -lt 0) { break }
+                $ch = [char]$c
+                if ($ch -ne "`r" -and $ch -ne "`n") { [void]$sb.Append($ch); continue }
+                if ($sb.Length -eq 0) { continue }
+                $line = $sb.ToString().Replace([string][char]8, '').TrimEnd()
+                [void]$sb.Clear()
+                $pct = Get-ProgressPercent $line
+                if ($pct -ge 0) {
+                    if ($pct -ne $lastPct) {
+                        $lastPct = $pct
+                        Write-Progress -Id 20 -Activity $Activity -Status ("{0} %" -f $pct) -PercentComplete $pct
+                    }
+                    continue
+                }
+                if ($line) {
+                    $lines.Add($line)
+                    if (-not $CaptureAll -and $lines.Count -gt 15) { $lines.RemoveAt(0) }
+                }
+            }
+            if ($sb.Length -gt 0) {
+                $rest = $sb.ToString().Replace([string][char]8, '').TrimEnd()
+                if ($rest -and (Get-ProgressPercent $rest) -lt 0) { $lines.Add($rest) }
+            }
+        } else {
+            $text = $reader.ReadToEnd()
+            foreach ($l in ($text -split "\r?\n")) {
+                if ($l.Trim() -ne '') { $lines.Add($l.TrimEnd()) }
             }
         }
-        return $true
-    } catch {
-        if ($ShowProgress) {
-            Write-Message "info" ("Unable to check if already extracted: " + $_.Exception.Message)
+
+        $proc.WaitForExit()
+        $exit = $proc.ExitCode
+        $err = $errTask.Result
+        if ($err) {
+            foreach ($l in ($err -split "\r?\n")) {
+                if ($l.Trim() -ne '') { $lines.Add($l.TrimEnd()) }
+            }
         }
-        return $false
+    } finally {
+        if (-not $proc.HasExited) { try { $proc.Kill() } catch {} }
+        $proc.Dispose()
+        if ($Activity) { Write-Progress -Id 20 -Activity $Activity -Completed }
     }
+    return [pscustomobject]@{ ExitCode = $exit; Lines = $lines }
 }
 
-function Is-RarEncrypted {
-    param(
-        [string]$Binary,
-        [string]$ArchivePath
-    )
-
-    try {
-        $binaryName = [System.IO.Path]::GetFileNameWithoutExtension($Binary)
-
-        if ($binaryName -in @("unrar", "rar")) {
-            $output = & $Binary l -p- $ArchivePath
-            if ($output -match "^\*" -or $output -match "encrypted headers") {
-                return $true
-            }
-        } elseif ($binaryName -eq "7z") {
-            $output = & $Binary l -slt -p- $ArchivePath
-            if ($output -match "^Encrypted = \+$" -or $output -match "Can not open encrypted archive") {
-                return $true
+function Get-TreeEntries {
+    # Iterative directory walk (no recursion, no stack overflow). Skips junctions/symlinks to avoid loops.
+    # Returns files, or directories with -Directories. Unreadable folders are skipped silently.
+    # -MaxDepth: levels below $Root to enter (-1 = unlimited, 0 = only $Root itself).
+    param([string]$Root, [switch]$Directories, [int]$MaxDepth = -1)
+    $stack  = New-Object 'System.Collections.Generic.Stack[string]'
+    $depths = New-Object 'System.Collections.Generic.Stack[int]'
+    $out    = New-Object 'System.Collections.Generic.List[System.IO.FileSystemInfo]'
+    $stack.Push($Root)
+    $depths.Push(0)
+    while ($stack.Count -gt 0) {
+        $dir = $stack.Pop()
+        $level = $depths.Pop()
+        try { $children = (New-Object System.IO.DirectoryInfo $dir).GetFileSystemInfos() } catch { continue }
+        foreach ($c in $children) {
+            if ($c -is [System.IO.DirectoryInfo]) {
+                if (($c.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
+                if ($MaxDepth -ge 0 -and $level -ge $MaxDepth) { continue }
+                if ($Directories) { $out.Add($c) }
+                $stack.Push($c.FullName)
+                $depths.Push($level + 1)
+            } elseif (-not $Directories) {
+                $out.Add($c)
             }
         }
-        return $false
-    } catch {
-        if ($ShowProgress) {
-            Write-Message "info" ("Error checking encryption: " + $_.Exception.Message)
-        }
-        return $false
     }
+    return $out.ToArray()
 }
 
-function Find-WindowsBinary {
-    param([string]$BinaryName)
+function Get-LastLines {
+    param($Lines)
+    $t = @($Lines | Where-Object { $_ } | Select-Object -Last 3)
+    return ($t -join ' | ')
+}
 
-    try {
-        $cmd = Get-Command $BinaryName -ErrorAction SilentlyContinue
-        if ($cmd) { return $cmd.Source }
-    } catch {}
+# ------------------------------------------------------------------ backend discovery
 
-    if ($BinaryName -like "*.exe") {
-        $nameWithoutExe = $BinaryName -replace '\.exe$', ''
-        try {
-            $cmd = Get-Command $nameWithoutExe -ErrorAction SilentlyContinue
-            if ($cmd) { return $cmd.Source }
-        } catch {}
+function Find-Binary {
+    param([string]$Name)   # '7z', 'unrar' or 'rar'
+
+    if ($Name -eq '7z' -and $SevenZipPath -and (Test-Path -LiteralPath $SevenZipPath -PathType Leaf)) {
+        return $SevenZipPath
     }
 
-    $commonPaths = @()
-    switch -Wildcard ($BinaryName) {
-        "*unrar*" {
-            $commonPaths = @(
-                "C:\Program Files\WinRAR\unrar.exe",
-                "C:\Program Files (x86)\WinRAR\unrar.exe",
-                "$env:ProgramFiles\WinRAR\unrar.exe",
-                "${env:ProgramFiles(x86)}\WinRAR\unrar.exe"
-            )
-        }
-        "*rar*" {
-            $commonPaths = @(
-                "C:\Program Files\WinRAR\rar.exe",
-                "C:\Program Files (x86)\WinRAR\rar.exe",
-                "$env:ProgramFiles\WinRAR\rar.exe",
-                "${env:ProgramFiles(x86)}\WinRAR\rar.exe"
-            )
-        }
-        "*7z*" {
-            $commonPaths = @(
-                "C:\Program Files\7-Zip\7z.exe",
-                "C:\Program Files (x86)\7-Zip\7z.exe",
-                "$env:ProgramFiles\7-Zip\7z.exe",
-                "${env:ProgramFiles(x86)}\7-zip\7z.exe"
-            )
-        }
-    }
+    $cmd = Get-Command ($Name + '.exe') -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($cmd) { return $cmd.Source }
 
-    foreach ($path in $commonPaths) {
-        if (Test-Path $path) {
-            return $path
-        }
+    $folder = if ($Name -eq '7z') { '7-Zip' } else { 'WinRAR' }
+    foreach ($base in @($env:ProgramFiles, ${env:ProgramFiles(x86)})) {
+        if (-not $base) { continue }
+        $p = Join-Path $base ($folder + '\' + $Name + '.exe')
+        if (Test-Path -LiteralPath $p -PathType Leaf) { return $p }
     }
-
+    $choco = 'C:\ProgramData\chocolatey\bin\' + $Name + '.exe'
+    if (Test-Path -LiteralPath $choco -PathType Leaf) { return $choco }
     return $null
 }
 
-function Detect-CleanUpHooks {
-    $hooks = @(
-        "nfo",
-        "rar",
-        "osx_junk",
-        "windows_junk",
-        "covers_folders",
-        "proof_folders",
-        "sample_folders",
-        "sample_videos",
-        "empty_folders"
-    )
-    $script:UNRARALL_DETECTED_CLEAN_UP_HOOKS = $hooks
-}
+# ------------------------------------------------------------------ passwords
 
-# NEW FUNCTION: Convert hook name to PascalCase function name
-function ConvertTo-PascalCase {
-    param([string]$HookName)
-    
-    # Split by underscore and capitalize each part
-    $parts = $HookName -split '_'
-    $pascalParts = $parts | ForEach-Object {
-        if ($_.Length -gt 0) {
-            $_.Substring(0,1).ToUpper() + $_.Substring(1).ToLower()
-        }
-    }
-    return ($pascalParts -join '')
-}
-
-function Unrarall-RemoveFileOrFolder {
-    param(
-        [string]$Path,
-        [string]$HookName
-    )
-
-    if (Test-Path $Path) {
-        if ($ShowProgress) {
-            Write-Message "nnl" ("Hook " + $HookName + ": Found " + $Path + ". Attempting to remove... ")
-        }
-        if (-not $Dry) {
-            Remove-Item $Path -Recurse -Force -ErrorAction SilentlyContinue
-        }
-        if ($ShowProgress) {
-            Write-Message "ok" "Success"
-        }
-    } elseif ($ShowProgress) {
-        Write-Message "info" ("Hook " + $HookName + ": No " + $Path + " file/folder found.")
-    }
-}
-
-function Unrarall-Clean-Nfo {
-    param(
-        [string]$Mode,
-        [string]$SFilename,
-        [string]$RarFileDir
-    )
-    switch ($Mode) {
-        "help"  { "Removes .nfo files with the same name as the .rar file" }
-        "clean" {
-            $nfoPath = Join-Path $RarFileDir ($SFilename + ".nfo")
-            Unrarall-RemoveFileOrFolder $nfoPath "nfo"
-        }
-    }
-}
-
-function Unrarall-Clean-Rar {
-    param(
-        [string]$Mode,
-        [string]$SFilename,
-        [string]$RarFileDir
-    )
-
-    switch ($Mode) {
-        "help"  { "Removes rar files and sfv files" }
-        "clean" {
-            if ($ShowProgress) {
-                Write-Message "info" ("Deleting " + $SFilename + " rar files (in '" + $RarFileDir + "')...")
-            }
-
-            if (-not (Test-Path $RarFileDir -PathType Container)) {
-                Write-Message "error" ("RARFILE_DIR (" + $RarFileDir + ") is not a directory")
-                return
-            }
-
-            # ^<sfilename>\.(sfv|[0-9]+|[r-z][0-9]+|rar|part[0-9]+\.rar)$
-            $escaped = [regex]::Escape($SFilename)
-            $pattern = '^' + $escaped + '\.(sfv|[0-9]+|[r-z][0-9]+|rar|part[0-9]+\.rar)$'
-
-            Get-ChildItem -Path $RarFileDir -File -ErrorAction SilentlyContinue |
-                Where-Object { $_.Name -match $pattern } |
-                ForEach-Object {
-                    Unrarall-RemoveFileOrFolder $_.FullName "rar"
-                }
-        }
-    }
-}
-
-function Unrarall-Clean-OsxJunk {
-    param(
-        [string]$Mode,
-        [string]$SFilename,
-        [string]$RarFileDir
-    )
-    switch ($Mode) {
-        "help"  { "Removes junk OSX files" }
-        "clean" {
-            $dsStorePath = Join-Path $RarFileDir ".DS_Store"
-            Unrarall-RemoveFileOrFolder $dsStorePath "osx_junk"
-        }
-    }
-}
-
-function Unrarall-Clean-WindowsJunk {
-    param(
-        [string]$Mode,
-        [string]$SFilename,
-        [string]$RarFileDir
-    )
-    switch ($Mode) {
-        "help"  { "Removes junk Windows files" }
-        "clean" {
-            $thumbsPath = Join-Path $RarFileDir "Thumbs.db"
-            Unrarall-RemoveFileOrFolder $thumbsPath "windows_junk"
-        }
-    }
-}
-
-function Unrarall-Clean-CoversFolders {
-    param(
-        [string]$Mode,
-        [string]$SFilename,
-        [string]$RarFileDir
-    )
-    switch ($Mode) {
-        "help"  { "Removes junk Covers folders" }
-        "clean" {
-            if ($ShowProgress) {
-                Write-Message "info" "Removing all Covers/ folders"
-            }
-            Get-ChildItem -Path $RarFileDir -Directory -Recurse -ErrorAction SilentlyContinue |
-                Where-Object { $_.Name -eq "Covers" -or $_.Name -eq "covers" } |
-                ForEach-Object {
-                    Unrarall-RemoveFileOrFolder $_.FullName "covers_folders"
-                }
-        }
-    }
-}
-
-function Unrarall-Clean-ProofFolders {
-    param(
-        [string]$Mode,
-        [string]$SFilename,
-        [string]$RarFileDir
-    )
-    switch ($Mode) {
-        "help"  { "Removes junk Proof folders" }
-        "clean" {
-            if ($ShowProgress) {
-                Write-Message "info" "Removing all Proof/ folders"
-            }
-            Get-ChildItem -Path $RarFileDir -Directory -Recurse -ErrorAction SilentlyContinue |
-                Where-Object { $_.Name -eq "Proof" -or $_.Name -eq "proof" } |
-                ForEach-Object {
-                    Unrarall-RemoveFileOrFolder $_.FullName "proof_folders"
-                }
-        }
-    }
-}
-
-function Unrarall-Clean-SampleFolders {
-    param(
-        [string]$Mode,
-        [string]$SFilename,
-        [string]$RarFileDir
-    )
-    switch ($Mode) {
-        "help"  { "Removes Sample folders" }
-        "clean" {
-            if ($ShowProgress) {
-                Write-Message "info" "Removing all Sample/ folders"
-            }
-            Get-ChildItem -Path $RarFileDir -Directory -Recurse -ErrorAction SilentlyContinue |
-                Where-Object { $_.Name -eq "Sample" -or $_.Name -eq "sample" } |
-                ForEach-Object {
-                    Unrarall-RemoveFileOrFolder $_.FullName "sample_folders"
-                }
-        }
-    }
-}
-
-function Unrarall-Clean-SampleVideos {
-    param(
-        [string]$Mode,
-        [string]$SFilename,
-        [string]$RarFileDir
-    )
-    switch ($Mode) {
-        "help"  { "Removes sample video files matching the release" }
-        "clean" {
-            if ($ShowProgress) {
-                Write-Message "info" ("Removing sample video files for " + $SFilename)
-            }
-            $videoExtensions = 'asf','avi','mkv','mp4','m4v','mov','mpg','mpeg','ogg','webm','wmv'
-            Get-ChildItem -Path $RarFileDir -Recurse -File -ErrorAction SilentlyContinue |
-                Where-Object {
-                    $_.Name -like "sample*" -and
-                    $videoExtensions -contains $_.Extension.TrimStart('.').ToLower()
-                } |
-                ForEach-Object {
-                    Unrarall-RemoveFileOrFolder $_.FullName "sample_videos"
-                }
-        }
-    }
-}
-
-function Unrarall-Clean-EmptyFolders {
-    param(
-        [string]$Mode,
-        [string]$SFilename,
-        [string]$RarFileDir
-    )
-    switch ($Mode) {
-        "help"  { "Removes empty folders" }
-        "clean" {
-            if ($ShowProgress) {
-                Write-Message "info" "Removing empty folders"
-            }
-            Get-ChildItem -Path $RarFileDir -Directory -Recurse -ErrorAction SilentlyContinue |
-                Sort-Object FullName -Descending |
-                ForEach-Object {
-                    $hasContent = Get-ChildItem -Path $_.FullName -Force -ErrorAction SilentlyContinue |
-                                  Where-Object { $_.Name -notin @('.','..') }
-                    if (-not $hasContent) {
-                        if (-not $Dry) {
-                            Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue
-                        }
-                    }
-                }
-        }
-    }
-}
-
-function Safe-Move {
-    param(
-        [string]$Source,
-        [string]$Destination
-    )
-
-    if ($Dry) {
-        Write-Message "info" ("[DRY] Move '" + $Source + "' -> '" + $Destination + "'")
-        return
-    }
-
-    if ($MV_BACKUP) {
-        if (Test-Path $Destination) {
-            $counter = 1
-            while (Test-Path ($Destination + "." + $counter)) {
-                $counter++
-            }
-            Move-Item $Source ($Destination + "." + $counter) -Force -ErrorAction SilentlyContinue
+function Get-PasswordCandidates {
+    if ($null -eq $script:FilePasswords) {
+        $script:FilePasswords = @()
+        if ($PasswordFile -and (Test-Path -LiteralPath $PasswordFile -PathType Leaf)) {
+            $script:FilePasswords = @(
+                Get-Content -LiteralPath $PasswordFile -Encoding UTF8 |
+                    Where-Object { $_.Trim() -ne '' -and -not $_.StartsWith('#') }
+            )
         } else {
-            Move-Item $Source $Destination -Force -ErrorAction SilentlyContinue
+            Write-Message 'warn' ("Password file not found: " + $PasswordFile)
+        }
+    }
+    # passwords that already worked go first
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    $list = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($p in (@($script:KnownPasswords) + @($script:FilePasswords))) {
+        if ($seen.Add([string]$p)) { $list.Add([string]$p) }
+    }
+    return $list
+}
+
+function Add-KnownPassword {
+    param([string]$Password)
+    if (-not $script:KnownPasswords.Contains($Password)) { $script:KnownPasswords.Add($Password) }
+}
+
+function Get-SevenZipInfo {
+    # Lists an archive with 7-Zip (technical format) and returns what we need to know.
+    param([string]$ArchivePath, [string]$Password)
+
+    $pw = if ($Password) { $Password } else { $script:ProbePassword }
+    $r = Invoke-Native -FilePath $script:Tool.Path `
+        -ArgumentList @('l', '-slt', '-sccUTF-8', ('-p' + $pw), '--', $ArchivePath) -CaptureAll -Utf8
+
+    $info = [pscustomobject]@{
+        Listed          = $false
+        HeaderEncrypted = $false
+        HasEncrypted    = $false
+        Smallest        = $null
+        SmallestSize    = -1
+        Paths           = (New-Object 'System.Collections.Generic.List[string]')
+        Output          = $r.Lines
+        ExitCode        = $r.ExitCode
+    }
+
+    $marker = $r.Lines.IndexOf('----------')
+    if ($r.ExitCode -le 1 -and $marker -ge 0) {
+        $info.Listed = $true
+    } elseif (($r.Lines -join "`n") -match 'Wrong password|(Can not|Cannot) open encrypted archive|Enter password') {
+        $info.HeaderEncrypted = $true
+    }
+    if (-not $info.Listed) { return $info }
+
+    # blank lines are dropped by Invoke-Native, so a new record starts at every 'Path =' key
+    $records = New-Object 'System.Collections.Generic.List[hashtable]'
+    $cur = $null
+    for ($i = $marker + 1; $i -lt $r.Lines.Count; $i++) {
+        $line = $r.Lines[$i]
+        $idx = $line.IndexOf(' = ')
+        if ($idx -le 0) { continue }
+        $key = $line.Substring(0, $idx)
+        if ($key -eq 'Path') {
+            if ($null -ne $cur) { $records.Add($cur) }
+            $cur = @{}
+        }
+        if ($null -ne $cur) { $cur[$key] = $line.Substring($idx + 3) }
+    }
+    if ($null -ne $cur) { $records.Add($cur) }
+
+    foreach ($rec in $records) {
+        if ($rec['Folder'] -eq '+') { continue }
+        $info.Paths.Add([string]$rec['Path'])
+        if ($rec['Encrypted'] -eq '+') {
+            $info.HasEncrypted = $true
+            $size = [long]0
+            [void][long]::TryParse([string]$rec['Size'], [ref]$size)
+            # remember the smallest non-empty encrypted file: cheapest way to test a password
+            if ($null -eq $info.Smallest -or ($size -gt 0 -and ($info.SmallestSize -le 0 -or $size -lt $info.SmallestSize))) {
+                $info.Smallest = [string]$rec['Path']
+                $info.SmallestSize = $size
+            }
+        }
+    }
+    return $info
+}
+
+function Resolve-ArchivePassword {
+    # Returns @{ Encrypted; Password; FromList }. Throws if the archive cannot be opened.
+    param([string]$ArchivePath)
+
+    if ($script:Tool.Kind -eq '7z') {
+        $probe = Get-SevenZipInfo $ArchivePath
+        if ($probe.Listed -and -not $probe.HasEncrypted) {
+            return [pscustomobject]@{ Encrypted = $false; Password = $null; FromList = $false }
+        }
+        if (-not $probe.Listed -and -not $probe.HeaderEncrypted) {
+            throw ("Cannot read archive: " + (Get-LastLines $probe.Output))
+        }
+
+        $candidates = @(Get-PasswordCandidates)
+        if ($candidates.Count -eq 0) { throw "Archive is encrypted and no passwords are available" }
+
+        foreach ($pw in $candidates) {
+            $info = if ($probe.Listed) { $probe } else { Get-SevenZipInfo $ArchivePath $pw }
+            if (-not $info.Listed) { continue }
+            if (-not $info.HasEncrypted -or -not $info.Smallest) {
+                Add-KnownPassword $pw
+                return [pscustomobject]@{ Encrypted = $true; Password = $pw; FromList = $true }
+            }
+            $t = Invoke-Native -FilePath $script:Tool.Path `
+                -ArgumentList @('t', ('-p' + $pw), '-sccUTF-8', '-bso0', '-bse1', '-bsp0', '--', $ArchivePath, $info.Smallest) -Utf8
+            if ($t.ExitCode -le 1) {
+                Add-KnownPassword $pw
+                return [pscustomobject]@{ Encrypted = $true; Password = $pw; FromList = $true }
+            }
+        }
+        throw ("No working password found (tried " + $candidates.Count + ")")
+    }
+    else {
+        $probe = Invoke-Native -FilePath $script:Tool.Path -ArgumentList @('l', '-p-', '-y', '--', $ArchivePath) -CaptureAll
+        $text = $probe.Lines -join "`n"
+        $encrypted = ($probe.Lines | Where-Object { $_ -match '^\s*\*' }).Count -gt 0 -or $text -match 'encrypted|password'
+        if (-not $encrypted) {
+            if ($probe.ExitCode -ne 0) { throw ("Cannot read archive: " + (Get-LastLines $probe.Lines)) }
+            return [pscustomobject]@{ Encrypted = $false; Password = $null; FromList = $false }
+        }
+
+        $candidates = @(Get-PasswordCandidates)
+        if ($candidates.Count -eq 0) { throw "Archive is encrypted and no passwords are available" }
+        foreach ($pw in $candidates) {
+            $t = Invoke-Native -FilePath $script:Tool.Path -ArgumentList @('t', '-y', '-idq', ('-p' + $pw), '--', $ArchivePath)
+            if ($t.ExitCode -eq 0) {
+                Add-KnownPassword $pw
+                return [pscustomobject]@{ Encrypted = $true; Password = $pw; FromList = $true }
+            }
+        }
+        throw ("No working password found (tried " + $candidates.Count + ")")
+    }
+}
+
+# ------------------------------------------------------------------ extraction
+
+function Test-AlreadyExtracted {
+    param([string]$ArchivePath, [string]$TargetDir)
+    try {
+        $paths = @()
+        if ($script:Tool.Kind -eq '7z') {
+            $info = Get-SevenZipInfo $ArchivePath
+            if (-not $info.Listed) { return $false }
+            $paths = @($info.Paths)
+        } else {
+            $r = Invoke-Native -FilePath $script:Tool.Path -ArgumentList @('lb', '-p-', '--', $ArchivePath) -CaptureAll
+            if ($r.ExitCode -ne 0) { return $false }
+            $paths = @($r.Lines | Where-Object { $_ })
+        }
+        if ($paths.Count -eq 0) { return $false }
+        foreach ($p in $paths) {
+            $rel = if ($Flat) { Split-Path -Leaf $p } else { $p }
+            if (-not (Test-Path -LiteralPath (Join-Path $TargetDir $rel))) { return $false }
+        }
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Invoke-Extract {
+    param([string]$ArchivePath, [string]$TargetDir, [string]$Password, [string]$Activity)
+
+    $act = if ($ShowProgress) { $Activity } else { $null }
+    $cmd = if ($Flat) { 'e' } else { 'x' }
+    $target = $TargetDir.TrimEnd('\', '/')
+
+    if ($script:Tool.Kind -eq '7z') {
+        $a = @($cmd, '-y', '-sccUTF-8', ('-o' + $target))
+        if ($Flat) { $a += '-aou' }                       # rename on name collisions instead of overwriting
+        if ($Password) { $a += ('-p' + $Password) }
+        $a += '-bso0'
+        $a += '-bse1'                                     # errors to stdout so we can show them
+        $a += $(if ($act) { '-bsp1' } else { '-bsp0' })
+        $a += '--'
+        $a += $ArchivePath
+        return Invoke-Native -FilePath $script:Tool.Path -ArgumentList $a -Activity $act -Utf8
+    } else {
+        $a = @($cmd, '-y', '-o+')
+        $a += $(if ($Password) { '-p' + $Password } else { '-p-' })
+        if (-not $act) { $a += '-idq' }
+        $a += '--'
+        $a += $ArchivePath
+        $a += ($target + '/')                             # unrar needs a trailing separator; '/' avoids the \" quoting trap
+        return Invoke-Native -FilePath $script:Tool.Path -ArgumentList $a -Activity $act
+    }
+}
+
+function Get-ExtractError {
+    param($Result)
+    $code = $Result.ExitCode
+    if ($script:Tool.Kind -eq '7z') {
+        $msg = switch ($code) {
+            2   { 'Fatal error (corrupt or missing volume, wrong password or write error)' }
+            7   { 'Command line error' }
+            8   { 'Not enough memory' }
+            255 { 'Stopped by user' }
+            default { "Extraction failed with exit code $code" }
         }
     } else {
-        Move-Item $Source $Destination -Force -ErrorAction SilentlyContinue
+        $msg = switch ($code) {
+            2   { 'Fatal error in archive' }
+            3   { 'CRC error - archive might be corrupted' }
+            4   { 'Attempt to modify a locked archive' }
+            5   { 'Write error' }
+            6   { 'Open error' }
+            7   { 'User error (wrong command)' }
+            8   { 'Not enough memory' }
+            9   { 'File create error' }
+            10  { 'No files matching pattern' }
+            11  { 'Wrong password' }
+            255 { 'User break' }
+            default { "Extraction failed with exit code $code" }
+        }
+    }
+    $detail = Get-LastLines $Result.Lines
+    if ($detail) { return "$msg [$detail]" }
+    return $msg
+}
+
+# ------------------------------------------------------------------ clean-up hooks
+
+function Remove-JunkItem {
+    param([string]$Path, [string]$Hook)
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    if ($Dry) { Write-Message 'info' ("[DRY] hook " + $Hook + ": would remove " + $Path); return }
+    try {
+        Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+        if ($ShowProgress) { Write-Message 'info' ("  [" + $Hook + "] removed: " + $Path) }
+    } catch {
+        Write-Message 'warn' ("  [" + $Hook + "] could not remove " + $Path + ": " + $_.Exception.Message)
     }
 }
 
-function Extract-WithProgress {
-    param(
-        [string]$Binary,
-        [string]$ArchivePath,
-        [string]$OutputDir,
-        [string]$Password = $null
-    )
-
-    $binaryName = [System.IO.Path]::GetFileNameWithoutExtension($Binary)
-    $success = $false
-    $exitCode = 0
-
-    if ($Binary -eq "echo") {
-        Write-Host ("[DRY] " + $Binary + " " + $ArchivePath + " -> " + $OutputDir)
-        return @{ Success = $true; ExitCode = 0 }
-    }
-
-    if ($binaryName -in @("unrar", "rar")) {
-        $args = @($UNRAR_METHOD, "-y", "-o+")
-        if ($Password) {
-            $args += ("-p" + $Password)
-        } else {
-            $args += "-p-"
-        }
-        $args += $ArchivePath
-        $args += $OutputDir
-
-        $process = Start-Process -FilePath $Binary -ArgumentList $args -NoNewWindow -Wait -PassThru
-        $exitCode = $process.ExitCode
-        if ($exitCode -eq 0) { $success = $true }
-    }
-    elseif ($binaryName -eq "7z") {
-        $args = @("x", "-y", "-o$OutputDir")
-        if ($Password) {
-            $args += ("-p" + $Password)
-        }
-        $args += $ArchivePath
-
-        $process = Start-Process -FilePath $Binary -ArgumentList $args -NoNewWindow -Wait -PassThru
-        $exitCode = $process.ExitCode
-        if ($exitCode -eq 0) { $success = $true }
-    }
-
-    return @{ Success = $success; ExitCode = $exitCode }
+function Remove-NamedFolders {
+    param([string]$Root, [string]$FolderName, [string]$Hook)
+    $dirs = @(Get-TreeEntries $Root -Directories | Where-Object { $_.Name -ieq $FolderName })
+    foreach ($d in $dirs) { Remove-JunkItem $d.FullName $Hook }
 }
 
-function Process-Directory {
-    param(
-        [string]$Path,
-        [int]$CurrentDepth
-    )
+function Invoke-CleanHook {
+    # Archive hooks (nfo, rar) work next to the archive; content hooks only inside the extracted folder.
+    param([string]$Hook, [string]$BaseName, [string]$ArchiveDir, [string]$TargetDir)
 
-    if ($ShowProgress) {
-        Write-Message "info" ("Processing directory: " + $Path)
+    switch ($Hook) {
+        'nfo' {
+            Remove-JunkItem (Join-Path $ArchiveDir ($BaseName + '.nfo')) $Hook
+        }
+        'rar' {
+            # only volumes/sfv of THIS release (zip/7z files with the same name are NOT touched)
+            $pattern = '^' + [regex]::Escape($BaseName) + '\.(sfv|rar|r[0-9]{2}|[0-9]{3}|part[0-9]+\.rar)$'
+            $files = @(Get-ChildItem -LiteralPath $ArchiveDir -File -Force -ErrorAction SilentlyContinue |
+                       Where-Object { $_.Name -match $pattern })
+            foreach ($f in $files) { Remove-JunkItem $f.FullName $Hook }
+        }
+        'osx_junk' {
+            $items = @(Get-TreeEntries $TargetDir | Where-Object { $_.Name -ieq '.DS_Store' })
+            $items += @(Get-TreeEntries $TargetDir -Directories | Where-Object { $_.Name -ieq '__MACOSX' })
+            foreach ($i in $items) { Remove-JunkItem $i.FullName $Hook }
+        }
+        'windows_junk' {
+            $items = @(Get-TreeEntries $TargetDir | Where-Object { $_.Name -ieq 'Thumbs.db' })
+            foreach ($i in $items) { Remove-JunkItem $i.FullName $Hook }
+        }
+        'covers_folders' { Remove-NamedFolders $TargetDir 'Covers' $Hook }
+        'proof_folders'  { Remove-NamedFolders $TargetDir 'Proof'  $Hook }
+        'sample_folders' { Remove-NamedFolders $TargetDir 'Sample' $Hook }
+        'sample_videos' {
+            $videoExt = @('.asf','.avi','.mkv','.mp4','.m4v','.mov','.mpg','.mpeg','.ogg','.ogv','.webm','.wmv')
+            # name must contain "sample" as a separate word, and the file must be small (< 250 MB)
+            $items = @(Get-TreeEntries $TargetDir |
+                       Where-Object {
+                           $videoExt -contains $_.Extension.ToLower() -and
+                           $_.Length -lt 250MB -and
+                           $_.Name -match '(?i)(^|[-._ ])sample([-._ ]|\.[^.]+$)'
+                       })
+            foreach ($i in $items) { Remove-JunkItem $i.FullName $Hook }
+        }
+        'empty_folders' {
+            $dirs = @(Get-TreeEntries $TargetDir -Directories |
+                      Sort-Object { $_.FullName.Length } -Descending)
+            foreach ($d in $dirs) {
+                if (-not (Test-Path -LiteralPath $d.FullName)) { continue }
+                $has = Get-ChildItem -LiteralPath $d.FullName -Force -ErrorAction SilentlyContinue | Select-Object -First 1
+                if (-not $has) { Remove-JunkItem $d.FullName $Hook }
+            }
+        }
     }
+}
 
-    $rarFiles = Get-ChildItem -Path $Path -Recurse -Include @("*.rar", "*.001") -File -ErrorAction SilentlyContinue
-    $totalFiles = $rarFiles.Count
-    $currentFile = 0
+# ------------------------------------------------------------------ main work
 
-    foreach ($file in $rarFiles) {
-        $currentFile++
-
-        if ($file.Name -match '\.part(\d+)\.rar$') {
-            if ([int]$matches[1] -ne 1) { continue }
-            $sfilename = $file.BaseName -replace '\.part\d+$', ''
-        } elseif ($file.Name -match '\.(\d{3})$') {
-            if ($matches[1] -ne "001") { continue }
-            $sfilename = $file.BaseName
+function Get-ArchiveStarts {
+    # First volumes only: *.rar (not .partNN.rar with NN > 1) and *.001
+    param([string]$Path)
+    $result = New-Object 'System.Collections.Generic.List[object]'
+    $files = @(Get-TreeEntries $Path -MaxDepth $ScanDepth |
+               Where-Object { $_.Extension -in @('.rar', '.001') } |
+               Sort-Object FullName)
+    foreach ($f in $files) {
+        $m = [regex]::Match($f.Name, '(?i)^(?<base>.+)\.part(?<n>\d+)\.rar$')
+        if ($m.Success) {
+            if ([int]$m.Groups['n'].Value -ne 1) { continue }
+            $base = $m.Groups['base'].Value
         } else {
-            $sfilename = $file.BaseName
+            $base = $f.BaseName
+        }
+        $result.Add([pscustomobject]@{ File = $f; BaseName = $base })
+    }
+    return $result
+}
+
+function Invoke-ArchiveDirectory {
+    param([string]$Path, [int]$RemainingDepth, [int]$Level = 0)
+
+    if ($ShowProgress) { Write-Message 'info' ("Scanning: " + $Path) }
+
+    $archives = @(Get-ArchiveStarts $Path)
+    $total = $archives.Count
+    $i = 0
+
+    foreach ($item in $archives) {
+        $i++
+        $file = $item.File
+        $base = $item.BaseName
+
+        if (-not $script:Processed.Add($file.FullName)) { continue }   # never handle an archive twice
+        $script:Found++
+
+        $targetDir = if ($Output) { $Output } else { Join-Path $file.DirectoryName $base }
+        $label = ("[{0}/{1}] {2}" -f $i, $total, $file.Name)
+
+        if ($ShowProgress -and $total -gt 0) {
+            $pp = @{ Id = (10 + $Level); Activity = ("Archives (level " + $Level + ")"); Status = $label;
+                     PercentComplete = [int](($i - 1) / $total * 100) }
+            if ($Level -gt 0) { $pp['ParentId'] = (9 + $Level) }
+            Write-Progress @pp
         }
 
-        $success = $true
-
-        if ($CKSFV -and -not $DisableCksfv) {
-            $sfvFile = Join-Path $file.DirectoryName ($sfilename + ".sfv")
-            if (Test-Path $sfvFile) {
-                if ($ShowProgress) {
-                    Write-Message "info" ("Checking CRC for " + $sfilename + " (not implemented)")
-                }
-            }
+        if ($SkipIfExists -and -not $Force -and (Test-AlreadyExtracted $file.FullName $targetDir)) {
+            $script:Skipped++
+            Write-Message 'ok' ("Already extracted: " + $file.Name)
+            continue
         }
 
-        if ($SkipIfExists -and -not $Force) {
-            if (Is-AlreadyExtracted $script:UNRARALL_BIN $file.FullName) {
-                Write-Message "ok" ("Already extracted: " + $file.Name)
-                continue
-            }
+        if ($Dry) {
+            Write-Message 'info' ("[DRY] " + $label + " -> " + $targetDir)
+            continue
         }
 
-        $tempDir = Join-Path $env:TEMP ([System.Guid]::NewGuid().ToString())
-        if (-not $Dry) {
-            New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
-        }
-
+        Write-Message 'nnl' ($label + " ... ")
+        $ok = $false
+        $createdDir = $false
         try {
-            if ($ShowProgress) {
-                Write-Message "nnl" ("[{0}/{1}] Extracting {2}... " -f $currentFile, $totalFiles, $file.Name)
-            } else {
-                Write-Message "nnl" ("Extracting {0}... " -f $file.Name)
+            if (-not (Test-Path -LiteralPath $targetDir)) {
+                New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
+                $createdDir = $true
             }
+            $pw = Resolve-ArchivePassword $file.FullName
+            $r = Invoke-Extract $file.FullName $targetDir $pw.Password $label
+            if ($r.ExitCode -gt 1) { throw (Get-ExtractError $r) }
 
-            if ($script:UNRARALL_BIN -eq "echo") {
-                Write-Message "ok" "(dry run)"
-                continue
-            }
-
-            $encrypted = Is-RarEncrypted $script:UNRARALL_BIN $file.FullName
-
-            if ($encrypted) {
-                if (Test-Path $script:UNRARALL_PASSWORD_FILE) {
-                    $passwords = Get-Content $script:UNRARALL_PASSWORD_FILE
-                    $extracted = $false
-
-                    foreach ($password in $passwords) {
-                        try {
-                            $result = Extract-WithProgress $script:UNRARALL_BIN $file.FullName $tempDir $password
-                            if ($result.Success) {
-                                if ($ShowProgress) {
-                                    Write-Message "info" "Extracted with password"
-                                }
-                                $extracted = $true
-                                break
-                            }
-                        } catch {}
-                    }
-
-                    if (-not $extracted) {
-                        throw "Could not extract with any password"
-                    }
-                } else {
-                    throw "Archive is encrypted but no password file provided"
-                }
-            } else {
-                $result = Extract-WithProgress $script:UNRARALL_BIN $file.FullName $tempDir
-                if (-not $result.Success) {
-                    switch ($result.ExitCode) {
-                        2    { throw "Fatal error in archive" }
-                        3    { throw "CRC error - archive might be corrupted" }
-                        4    { throw "Attempt to modify a locked archive" }
-                        5    { throw "Write error" }
-                        6    { throw "Open error" }
-                        7    { throw "User error (wrong command)" }
-                        8    { throw "Not enough memory" }
-                        9    { throw "File create error" }
-                        10   { throw "No files matching pattern" }
-                        255  { throw "User break" }
-                        default { throw ("Extraction failed with error code: " + $result.ExitCode) }
-                    }
-                }
-            }
-
-            Write-Message "ok" "OK"
-            $script:COUNT++
-
-            if ($CurrentDepth -gt 0) {
-                $nestedRars = Get-ChildItem -Path $tempDir -Recurse -Include @("*.rar", "*.001") -File -ErrorAction SilentlyContinue
-                if ($nestedRars.Count -gt 0) {
-                    if ($ShowProgress) {
-                        Write-Message "info" ("Detected rar archives inside of " + $file.FullName + ", recursively extracting")
-                    }
-                    Process-Directory $tempDir ($CurrentDepth - 1)
-                }
-            }
-
-            $extractedFiles = if (Test-Path $tempDir) {
-                Get-ChildItem -Path $tempDir -Recurse -File -ErrorAction SilentlyContinue
-            } else { @() }
-
-            if ($Output) {
-                $targetDir = $Output
-            } else {
-                # Extract to subdirectory named after the RAR file
-                $targetDir = Join-Path $file.DirectoryName $sfilename
-                if (-not (Test-Path $targetDir)) {
-                    if (-not $Dry) {
-                        New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
-                    }
-                }
-            }
-
-            foreach ($extractedFile in $extractedFiles) {
-                $relativePath = $extractedFile.FullName.Substring($tempDir.Length + 1)
-                $targetPath   = Join-Path $targetDir $relativePath
-
-                $targetDirPath = Split-Path $targetPath -Parent
-                if (-not (Test-Path $targetDirPath)) {
-                    if (-not $Dry) {
-                        New-Item -ItemType Directory -Path $targetDirPath -Force | Out-Null
-                    }
-                }
-
-                Safe-Move $extractedFile.FullName $targetPath
-            }
-
-            if ($script:UNRARALL_CLEAN_UP_HOOKS_TO_RUN[0] -ne "none") {
-                if ($ShowProgress) {
-                    Write-Message "nnl" "Running hooks..."
-                }
-
-                foreach ($hook in $script:UNRARALL_CLEAN_UP_HOOKS_TO_RUN) {
-                    if ($hook -eq "all") {
-                        foreach ($detectedHook in $script:UNRARALL_DETECTED_CLEAN_UP_HOOKS) {
-                            if ($ShowProgress) {
-                                Write-Message "nnl" ($detectedHook + " ")
-                            }
-                            # FIXED: Convert hook name to PascalCase
-                            $functionName = "Unrarall-Clean-" + (ConvertTo-PascalCase $detectedHook)
-                            & $functionName "clean" $sfilename $file.DirectoryName
-                        }
-                    } else {
-                        if ($ShowProgress) {
-                            Write-Message "nnl" ($hook + " ")
-                        }
-                        # FIXED: Convert hook name to PascalCase
-                        $functionName = "Unrarall-Clean-" + (ConvertTo-PascalCase $hook)
-                        & $functionName "clean" $sfilename $file.DirectoryName
-                    }
-                }
-
-                if ($ShowProgress) {
-                    Write-Message "ok" "Finished running hooks"
-                }
-            }
-
+            if ($r.ExitCode -eq 1)  { Write-Message 'warn' 'OK (with warnings)' }
+            elseif ($pw.FromList)   { Write-Message 'ok' 'OK (password from list)' }
+            else                    { Write-Message 'ok' 'OK' }
+            $ok = $true
         } catch {
-            Write-Message "error" ("Failed: " + $_.Exception.Message)
-            $script:FAIL_COUNT++
-            $script:COUNT--
-        } finally {
-            if (-not $Dry -and (Test-Path $tempDir)) {
-                Remove-Item $tempDir -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Message 'error' ("FAILED: " + $_.Exception.Message)
+            $script:FailCount++
+            if ($createdDir -and -not (Get-ChildItem -LiteralPath $targetDir -Force -ErrorAction SilentlyContinue)) {
+                Remove-Item -LiteralPath $targetDir -Force -ErrorAction SilentlyContinue
+            }
+        }
+        if (-not $ok) { continue }
+        $script:Count++
+
+        # nested archives
+        if ($RemainingDepth -gt 0) {
+            $nested = @(Get-ArchiveStarts $targetDir)
+            if ($nested.Count -gt 0) {
+                if ($ShowProgress) { Write-Message 'info' ("Nested archives found in " + $file.Name + ", extracting") }
+                Invoke-ArchiveDirectory $targetDir ($RemainingDepth - 1) ($Level + 1)
             }
         }
 
-        if ($ShowProgress -and $totalFiles -gt 0) {
-            $percent = [math]::Round(($currentFile / $totalFiles) * 100, 1)
-            Write-Message "info" ("Overall progress: {0}% ({1}/{2})" -f $percent, $currentFile, $totalFiles)
+        # clean-up hooks
+        foreach ($hook in $script:Hooks) {
+            try { Invoke-CleanHook $hook $base $file.DirectoryName $targetDir }
+            catch { Write-Message 'warn' ("Hook " + $hook + " failed: " + $_.Exception.Message) }
         }
     }
+
+    if ($ShowProgress) { Write-Progress -Id (10 + $Level) -Activity 'Archives' -Completed }
 }
 
-# Main script execution
+# ------------------------------------------------------------------ entry point
+
 if ($Help)    { Show-Usage; exit 0 }
 if ($Version) { Write-Host $UNRARALL_VERSION; exit 0 }
 
-# Backend selection
-if ($SevenZip) {
-    $script:UNRARALL_BIN = Find-WindowsBinary "7z.exe"
-    if (-not $script:UNRARALL_BIN) { $script:UNRARALL_BIN = "7z.exe" }
-} elseif ($Backend) {
-    $script:UNRARALL_BIN = Find-WindowsBinary ($Backend + ".exe")
-    if (-not $script:UNRARALL_BIN) { $script:UNRARALL_BIN = ($Backend + ".exe") }
-} elseif ($Dry) {
-    $script:UNRARALL_BIN = "echo"
-}
-
-if (-not $script:UNRARALL_BIN -or $script:UNRARALL_BIN -ne "echo") {
-    foreach ($binary in $UNRAR_BINARIES) {
-        $foundBinary = Find-WindowsBinary $binary
-        if ($foundBinary) {
-            $script:UNRARALL_BIN = $foundBinary
-            break
-        }
-    }
-
-    if (-not $script:UNRARALL_BIN) {
-        Write-Message "error" "No extraction binary found. Please install one of:"
-        Write-Message "error" "  - WinRAR (unrar.exe / rar.exe)"
-        Write-Message "error" "  - 7-Zip (7z.exe)"
-        Write-Message "error" "or specify backend via -Backend"
-        exit 1
+# backend
+$order = if ($Backend) { @($Backend) } elseif ($SevenZip) { @('7z') } else { @('7z', 'unrar', 'rar') }
+foreach ($n in $order) {
+    $p = Find-Binary $n
+    if ($p) {
+        $script:Tool = [pscustomobject]@{ Path = $p; Kind = $(if ($n -eq '7z') { '7z' } else { 'rar' }) }
+        break
     }
 }
-
-if ($Clean) {
-    $script:UNRARALL_CLEAN_UP_HOOKS_TO_RUN = $Clean
-} else {
-    $script:UNRARALL_CLEAN_UP_HOOKS_TO_RUN = @("none")
-}
-
-Detect-CleanUpHooks
-
-if ($script:UNRARALL_CLEAN_UP_HOOKS_TO_RUN[0] -ne "none") {
-    foreach ($hook in $script:UNRARALL_CLEAN_UP_HOOKS_TO_RUN) {
-        if ($hook -eq "all" -or $hook -eq "none") { continue }
-        if ($script:UNRARALL_DETECTED_CLEAN_UP_HOOKS -notcontains $hook) {
-            Write-Message "error" ("Invalid clean-up hook: " + $hook)
-            exit 1
-        }
-    }
-}
-
-if (-not (Test-Path $Directory -PathType Container)) {
-    Write-Message "error" ("Directory not found: " + $Directory)
+if (-not $script:Tool) {
+    Write-Message 'error' "No extraction tool found. Please install 7-Zip (7z.exe) or WinRAR (unrar.exe / rar.exe),"
+    Write-Message 'error' "or point -SevenZipPath / -Backend to it."
     exit 1
 }
 
-$Directory = (Resolve-Path $Directory).Path
+# hooks (run in a fixed, sensible order regardless of how they were typed)
+if ($Clean -contains 'none') { $script:Hooks = @() }
+elseif ($Clean -contains 'all') { $script:Hooks = $script:AllHooks }
+else { $script:Hooks = @($script:AllHooks | Where-Object { $Clean -contains $_ }) }
+
+# paths
+if (-not (Test-Path -LiteralPath $Directory -PathType Container)) {
+    Write-Message 'error' ("Directory not found: " + $Directory)
+    exit 1
+}
+$Directory = (Resolve-Path -LiteralPath $Directory).Path
+if ($Output) {
+    $Output = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Output)
+}
 
 if ($ShowProgress) {
-    Write-Message "info" ("Using " + $script:UNRARALL_BIN + " for extraction")
+    Write-Message 'info' ("Using " + $script:Tool.Path + " for extraction")
+    Write-Message 'info' ("Scan depth: " + $(if ($ScanDepth -lt 0) { 'unlimited' } else { $ScanDepth }) + ", nested archive depth: " + $Depth)
+    if ($script:Hooks.Count -gt 0) { Write-Message 'info' ("Clean-up hooks: " + ($script:Hooks -join ', ')) }
 }
 
-Process-Directory $Directory $Depth
+Invoke-ArchiveDirectory $Directory $Depth 0
 
-if ($script:COUNT -gt 0) {
-    $exitPhrase = "found and extracted"
-    if ($script:UNRARALL_CLEAN_UP_HOOKS_TO_RUN[0] -ne "none") {
-        $exitPhrase = "found, extracted and then cleaned using the following hooks: " +
-            ($script:UNRARALL_CLEAN_UP_HOOKS_TO_RUN -join ", ")
-    }
-    Write-Message "info" ("{0} rar files {1}" -f $script:COUNT, $exitPhrase)
-} else {
-    Write-Message "error" "no rar files extracted"
+# summary
+if ($Dry) {
+    Write-Message 'info' ("Dry run finished: {0} archive(s) would be processed" -f $script:Found)
+    exit 0
 }
 
-if ($script:FAIL_COUNT -gt 0) {
-    if (-not $Quiet) {
-        Write-Message "error" ("{0} failure(s)" -f $script:FAIL_COUNT)
+if ($script:Count -gt 0) {
+    $phrase = 'found and extracted'
+    if ($script:Hooks.Count -gt 0) {
+        $phrase = 'found, extracted and cleaned using: ' + ($script:Hooks -join ', ')
     }
-    if (-not $AllowFailures) {
-        exit 1
-    } else {
-        if ($script:COUNT -eq 0) {
-            exit 1
-        } else {
-            Write-Message "info" ("{0} success(es)" -f $script:COUNT)
-        }
-    }
+    Write-Message 'info' ("{0} archive(s) {1}" -f $script:Count, $phrase)
+} elseif ($script:Found -eq 0) {
+    Write-Message 'warn' 'No archives found'
+} elseif ($script:Skipped -gt 0 -and $script:FailCount -eq 0) {
+    Write-Message 'info' ("Nothing to do: {0} archive(s) already extracted" -f $script:Skipped)
 }
+
+if ($script:FailCount -gt 0) {
+    Write-Message 'error' ("{0} failure(s)" -f $script:FailCount)
+    if (-not $AllowFailures -or $script:Count -eq 0) { exit 1 }
+}
+exit 0
