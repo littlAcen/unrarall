@@ -20,14 +20,15 @@ param(
     [ValidateRange(-1,100)]
     [int]$ScanDepth = -1,       # folder levels below the start folder to search for archives (-1 = unlimited, 0 = start folder only)
     [switch]$SkipIfExists,
-    [string]$PasswordFile = "C:\Users\JAMy\Documents\important_FileZ\unrar_passwords.txt",
+    [string]$PasswordFile = "C:\Users\acen\Documents\important_FileZ\unrar_passwords.txt",
     [switch]$SevenZip,
     [string]$SevenZipPath = "C:\Program Files\7-Zip\7z.exe",
     [ValidateSet('7z','unrar','rar')]
     [string]$Backend,
     [switch]$Dry,
     [switch]$AllowFailures,
-    [switch]$FullPath,          # legacy: keeping folder structure is the default now
+    [switch]$KeepFailed,        # do NOT delete archives that cannot be extracted (default: they are deleted and logged)
+    [switch]$FullPath,         # legacy: keeping folder structure is the default now
     [switch]$Flat,              # extract all files without folder structure
     [switch]$Help,
     [switch]$Version
@@ -39,6 +40,8 @@ $UNRARALL_VERSION = "0.6.0-acen-configured"
 if (-not $PSBoundParameters.ContainsKey('ShowProgress')) { $ShowProgress = [switch](-not $Quiet) }
 if ($Quiet) { $ShowProgress = [switch]$false }
 if (-not $PSBoundParameters.ContainsKey('AllowFailures')) { $AllowFailures = [switch]$true }
+$DeleteFailed  = -not $KeepFailed
+$FailedLogName = 'failed_extractions_unrarall.txt'
 
 # ---- script state ----
 $script:Tool           = $null
@@ -46,6 +49,7 @@ $script:Count          = 0
 $script:FailCount      = 0
 $script:Found          = 0
 $script:Skipped        = 0
+$script:Deleted        = 0
 $script:FilePasswords  = $null
 $script:KnownPasswords = New-Object 'System.Collections.Generic.List[string]'
 $script:Processed      = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
@@ -95,6 +99,11 @@ OPTIONS
   -SevenZip            Force 7-Zip
   -AllowFailures       Exit 0 if at least one archive succeeded (default on;
                        use -AllowFailures:$false to exit 1 on any failure)
+  -KeepFailed          Do not delete archives that cannot be extracted. By default such an
+                       archive (all volumes) and its extraction folder are deleted and the
+                       archive name is appended to failed_extractions_unrarall.txt (in the
+                       folder of the archive, or in -Output). Nothing is deleted when the
+                       failure was a disk/permission/memory problem or the name cannot be logged.
   -DisableCksfv        Deprecated, ignored
   -FullPath            Legacy, ignored (structure is kept by default)
 
@@ -552,6 +561,58 @@ function Remove-JunkItem {
     }
 }
 
+function Get-ArchiveVolumes {
+    # Volumes/sfv of ONE release (zip/7z files with the same name are NOT touched)
+    param([string]$ArchiveDir, [string]$BaseName)
+    $pattern = '^' + [regex]::Escape($BaseName) + '\.(sfv|rar|r[0-9]{2}|[0-9]{3}|part[0-9]+\.rar)$'
+    return @(Get-ChildItem -LiteralPath $ArchiveDir -File -Force -ErrorAction SilentlyContinue |
+             Where-Object { $_.Name -match $pattern })
+}
+
+function Invoke-FailedArchive {
+    # Archive could not be extracted: log its name, then delete its volumes and its extraction folder.
+    param($File, [string]$BaseName, [string]$TargetDir, [string]$Message)
+
+    if (-not $DeleteFailed) { return }
+
+    # Environment problems (disk full, access denied, abort) say nothing about the archive: keep everything.
+    if ($Message -match '(?i)write error|not enough space|no space|disk is full|access is denied|permission denied|not enough memory|out of memory|stopped by user|user break|command line error|user error|file create error') {
+        Write-Message 'warn' '  Not deleted: the error does not look like a defective archive'
+        return
+    }
+
+    # 1. log first - if the name cannot be recorded, nothing is deleted
+    $logDir  = if ($Output) { $Output } else { $File.DirectoryName }
+    $logFile = Join-Path $logDir $FailedLogName
+    try {
+        if (-not (Test-Path -LiteralPath $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
+        Add-Content -LiteralPath $logFile -Value $File.Name -Encoding UTF8 -ErrorAction Stop
+    } catch {
+        Write-Message 'warn' ("  Not deleted: could not write " + $logFile + ": " + $_.Exception.Message)
+        return
+    }
+
+    # 2. extraction folder (never the shared -Output folder, never the archive's own folder)
+    $sep = [System.IO.Path]::DirectorySeparatorChar
+    $isOwnSubfolder = (-not $Output) -and ($TargetDir -ne $File.DirectoryName) -and
+                      $TargetDir.StartsWith($File.DirectoryName.TrimEnd('\', '/') + $sep, [StringComparison]::OrdinalIgnoreCase)
+    if ($isOwnSubfolder -and (Test-Path -LiteralPath $TargetDir)) {
+        try { Remove-Item -LiteralPath $TargetDir -Recurse -Force -ErrorAction Stop }
+        catch { Write-Message 'warn' ("  Could not delete folder " + $TargetDir + ": " + $_.Exception.Message) }
+    }
+
+    # 3. the archive itself (all volumes)
+    $paths = @(Get-ArchiveVolumes $File.DirectoryName $BaseName | ForEach-Object { $_.FullName })
+    if ($paths -notcontains $File.FullName) { $paths += $File.FullName }
+    foreach ($p in $paths) {
+        try { Remove-Item -LiteralPath $p -Force -ErrorAction Stop }
+        catch { Write-Message 'warn' ("  Could not delete " + $p + ": " + $_.Exception.Message) }
+    }
+
+    $script:Deleted++
+    Write-Message 'warn' ("  Deleted defective archive and its folder, logged in " + $logFile)
+}
+
 function Remove-NamedFolders {
     param([string]$Root, [string]$FolderName, [string]$Hook)
     $dirs = @(Get-TreeEntries $Root -Directories | Where-Object { $_.Name -ieq $FolderName })
@@ -567,11 +628,7 @@ function Invoke-CleanHook {
             Remove-JunkItem (Join-Path $ArchiveDir ($BaseName + '.nfo')) $Hook
         }
         'rar' {
-            # only volumes/sfv of THIS release (zip/7z files with the same name are NOT touched)
-            $pattern = '^' + [regex]::Escape($BaseName) + '\.(sfv|rar|r[0-9]{2}|[0-9]{3}|part[0-9]+\.rar)$'
-            $files = @(Get-ChildItem -LiteralPath $ArchiveDir -File -Force -ErrorAction SilentlyContinue |
-                       Where-Object { $_.Name -match $pattern })
-            foreach ($f in $files) { Remove-JunkItem $f.FullName $Hook }
+            foreach ($f in @(Get-ArchiveVolumes $ArchiveDir $BaseName)) { Remove-JunkItem $f.FullName $Hook }
         }
         'osx_junk' {
             $items = @(Get-TreeEntries $TargetDir | Where-Object { $_.Name -ieq '.DS_Store' })
@@ -685,9 +742,12 @@ function Invoke-ArchiveDirectory {
             else                    { Write-Message 'ok' 'OK' }
             $ok = $true
         } catch {
-            Write-Message 'error' ("FAILED: " + $_.Exception.Message)
+            $failMsg = $_.Exception.Message
+            Write-Message 'error' ("FAILED: " + $failMsg)
             $script:FailCount++
-            if ($createdDir -and -not (Get-ChildItem -LiteralPath $targetDir -Force -ErrorAction SilentlyContinue)) {
+            if ($DeleteFailed) {
+                Invoke-FailedArchive $file $base $targetDir $failMsg
+            } elseif ($createdDir -and -not (Get-ChildItem -LiteralPath $targetDir -Force -ErrorAction SilentlyContinue)) {
                 Remove-Item -LiteralPath $targetDir -Force -ErrorAction SilentlyContinue
             }
         }
@@ -776,6 +836,9 @@ if ($script:Count -gt 0) {
 
 if ($script:FailCount -gt 0) {
     Write-Message 'error' ("{0} failure(s)" -f $script:FailCount)
+    if ($script:Deleted -gt 0) {
+        Write-Message 'warn' ("{0} defective archive(s) deleted, names are in {1}" -f $script:Deleted, $FailedLogName)
+    }
     if (-not $AllowFailures -or $script:Count -eq 0) { exit 1 }
 }
 exit 0
